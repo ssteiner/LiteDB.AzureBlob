@@ -1,6 +1,9 @@
-﻿using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Auth;
-using Microsoft.Azure.Storage.Blob;
+﻿using Azure;
+using Azure.Identity;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Azure.Storage.Blobs.Specialized;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -15,19 +18,19 @@ namespace LiteDB.AzureBlob
     /// <summary>
     /// Use Azure Page Blob as storage backend for LiteDB 5
     /// </summary>
-    public class AzurePageBlobStream : Stream
+    public class AzurePageBlobStreamNew : Stream
     {
         // configurations
         public static bool WriteDebugLogs = false;
         public static int PageSize = 1024 * 8;  // Default PageSize of LiteDB 5
         public static int Pages = 8;
-        public static string DefaultContainerName = "litedbs";
-        public static long DefaultStreamSize = 1024 * 1024 * 1024; //1G
-        public static PremiumPageBlobTier DefaultBlobTier = PremiumPageBlobTier.P4;
+        public const string DefaultContainerName = "litedbs";
+        public static long DefaultStreamSize = 1024 * 1024 * 10; //1G
+        public static AccessTier DefaultBlobTier = AccessTier.P4;
 
         private const string MetadataLengthKey = "STREAM_LENGTH";
 
-        readonly CloudPageBlob Blob;
+        readonly PageBlobClient Blob;
         readonly ConcurrentDictionary<long, byte[]> Cache = new ConcurrentDictionary<long, byte[]>();
         const int NumberOfLocks = 111;  // should be more than enough
         readonly object[] Locks = new object[NumberOfLocks];
@@ -35,18 +38,29 @@ namespace LiteDB.AzureBlob
         readonly BlockingCollection<byte[]> Buffers = new BlockingCollection<byte[]>();
         long LazyLength = 0;
 
-        public AzurePageBlobStream(string connString, string databaseName)
+        private IDictionary<string, string> metaData;
+        private ILogger logger;
+
+        public AzurePageBlobStreamNew(string connString, string databaseName)
+            : this(GetBlobReference(connString, databaseName), databaseName)
         {
-            CloudPageBlob blob = GetBlobReference(connString, databaseName);
-            if (!blob.ExistsAsync().Result)
+        }
+
+        public AzurePageBlobStreamNew(string storageAccount, string containerName, string databaseName)
+            : this(GetBlobReferenceFromStorageAccount(storageAccount, containerName, databaseName), databaseName)
+        {
+        }
+
+        private AzurePageBlobStreamNew(PageBlobClient blob, string databaseName)
+        {
+            if (!blob.Exists().Value)
             {
                 if (WriteDebugLogs)
                     Console.WriteLine("Creating new page blob file " + databaseName);
-                blob.CreateAsync(DefaultStreamSize).Wait();
-                blob.SetPremiumBlobTierAsync(DefaultBlobTier).Wait();
+                var contentInfo = blob.Create(DefaultStreamSize);
+                //blob.SetAccessTier(DefaultBlobTier);
             }
             Blob = blob;
-
             for (var i = 0; i < NumberOfLocks; i++)
                 Locks[i] = new object();
             for (var i = 0; i < Math.Max(Environment.ProcessorCount * 2, 10); i++)
@@ -55,15 +69,23 @@ namespace LiteDB.AzureBlob
                 ReadAhead(0);
         }
 
-        private static CloudPageBlob GetBlobReference(string connString, string databaseName)
+        private static PageBlobClient GetBlobReference(string connString, string databaseName, string containerName = DefaultContainerName)
         {
-            CloudStorageAccount.TryParse(connString, out var account);
-            var client = account.CreateCloudBlobClient();
+            var client = new BlobServiceClient(connString);
+            return GetBlobClient(client, containerName, databaseName);
+        }
 
-            var container = client.GetContainerReference(DefaultContainerName);
-            container.CreateIfNotExistsAsync().Wait();
+        private static PageBlobClient GetBlobReferenceFromStorageAccount(string storageAccount, string containerName, string databaseName)
+        {
+            var client = new BlobServiceClient(new Uri($"https://{storageAccount}.blob.core.windows.net"), new DefaultAzureCredential());
+            return GetBlobClient(client, containerName, databaseName);
+        }
 
-            var blob = container.GetPageBlobReference(databaseName);
+        private static PageBlobClient GetBlobClient(BlobServiceClient client, string containerName, string databaseName)
+        {
+            var containerClient = client.GetBlobContainerClient(containerName);
+            containerClient.CreateIfNotExists();
+            var blob = containerClient.GetPageBlobClient(databaseName);
             return blob;
         }
 
@@ -78,8 +100,10 @@ namespace LiteDB.AzureBlob
             _Length = newLength;
             if (WriteDebugLogs)
                 Console.WriteLine($"SetLength = {newLength / PageSize}");
-            Blob.Metadata[MetadataLengthKey] = newLength.ToString();
-            Blob.SetMetadataAsync(); // .Wait();
+            if (metaData == null)
+                metaData = Blob.GetProperties().Value.Metadata;
+            metaData[MetadataLengthKey] = newLength.ToString();
+            Blob.SetMetadataAsync(metaData); // .Wait();
         }
 
         long? _Length = null;
@@ -89,8 +113,8 @@ namespace LiteDB.AzureBlob
             {
                 if (!_Length.HasValue)
                 {
-                    Blob.FetchAttributesAsync().Wait();
-                    if (!Blob.Metadata.TryGetValue(MetadataLengthKey, out string value) || !long.TryParse(value, out long realLength))
+                    metaData = Blob.GetProperties().Value.Metadata;
+                    if (!metaData.TryGetValue(MetadataLengthKey, out string value) || !long.TryParse(value, out long realLength))
                     {
                         SetLengthInternal(0);
                         _Length = 0;
@@ -187,10 +211,13 @@ namespace LiteDB.AzureBlob
             {
                 if (WriteDebugLogs)
                     Console.WriteLine($"Downloading from {position} length {buf.Length} with return buffer");
-                var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
-                Debug.Assert(ret == buf.Length);
+                //var res = Blob.DownloadContentAsync(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) }).Result;
+                var res = Blob.DownloadContent(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) });
+                //res.Value.Content.ToArray().CopyTo(buf, 0);
+                res.Value.Content.ToMemory().CopyTo(buf);
+                //var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
+                //Debug.Assert(ret == buf.Length);
                 Buffer.BlockCopy(CachePage(0), 0, bufToReturn, offset, PageSize);
-
                 Task.Run(() =>
                 {
                     for (var i = 1; i < Pages; i++)
@@ -204,8 +231,12 @@ namespace LiteDB.AzureBlob
                 {
                     if (WriteDebugLogs)
                         Console.WriteLine($"Downloading from {position} length {buf.Length}");
-                    var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
-                    Debug.Assert(ret == buf.Length);
+                    //var res = Blob.DownloadContentAsync(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) }).Result;
+                    var res = Blob.DownloadContent(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) });
+                    //res.Value.Content.ToArray().CopyTo(buf, 0);
+                    res.Value.Content.ToMemory().CopyTo(buf);
+                    //var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
+                    //Debug.Assert(ret == buf.Length);
                     for (var i = 0; i < Pages; i++)
                         CachePage(i);
                     Buffers.Add(buf);
@@ -294,7 +325,8 @@ namespace LiteDB.AzureBlob
                             {
                                 if (WriteDebugLogs)
                                     Console.WriteLine($"WriteOne @{p.Key / PageSize}");
-                                Blob.WritePagesAsync(ms, p.Key, null).Wait();
+                                Blob.UploadPages(ms, p.Key);
+                                //Blob.WritePagesAsync(ms, p.Key, null).Wait();
                             }
                         });
                         tasks.Add(task);
@@ -327,7 +359,8 @@ namespace LiteDB.AzureBlob
                                 Console.WriteLine($"WriteBatch @{offsetStart / PageSize} #{cnt}");
                             using (var ms = new MemoryStream(buf, 0, offsetWithinBuf))
                             {
-                                Blob.WritePagesAsync(ms, offsetStart, null).Wait();
+                                Blob.UploadPages(ms, offsetStart);
+                                //Blob.WritePagesAsync(ms, offsetStart, null).Wait();
                             }
                             Buffers.Add(buf);
                         });
@@ -349,17 +382,39 @@ namespace LiteDB.AzureBlob
         {
             Console.WriteLine("Deleting " + name);
             var blob = GetBlobReference(connString, name);
-            blob.DeleteIfExistsAsync().Wait();
+            blob.DeleteIfExists();
+        }
+
+        public static void DropDatabase(string accountName, string containerName, string name)
+        {
+            Console.WriteLine("Deleting " + name);
+            var blob = GetBlobReferenceFromStorageAccount(accountName, containerName, name);
+            blob.DeleteIfExists();
         }
 
         public static void Download(string connString, string dbName, string localFile)
         {
             Console.WriteLine($"Download {dbName} to {localFile}");
             using (var s = File.OpenWrite(localFile))
-            using (var page = new AzurePageBlobStream(connString, dbName))
+            using (var page = new AzurePageBlobStreamNew(connString, dbName))
             {
-                page.Blob.DownloadRangeToStreamAsync(s, 0, page.Length).Wait();
+                page.Blob.DownloadTo(s);
             }
+        }
+
+        public static void Download(string accountName, string containerName, string dbName, string localFile)
+        {
+            Console.WriteLine($"Download {dbName} to {localFile}");
+            using (var s = File.OpenWrite(localFile))
+            using (var page = new AzurePageBlobStreamNew(accountName, containerName, dbName))
+            {
+                page.Blob.DownloadTo(s);
+            }
+        }
+
+        private void Log(string message, LogLevel level)
+        {
+            logger?.Log(level, message);
         }
 
         /*

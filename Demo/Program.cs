@@ -3,6 +3,7 @@ using LiteDB.AzureBlob;
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace Demo
 {
@@ -12,6 +13,7 @@ namespace Demo
         {
             // TestLiteDBWithAzureBlockBlob();
             TestLiteDBWithAzurePageBlob();
+            TestLiteDBWithAzurePageBlobNew();
         }
 
         private static void TestLiteDBWithAzureBlockBlob()
@@ -31,9 +33,9 @@ namespace Demo
                 TestReadDatabase(stream);
 
             // clean up; you can checkout the files in azure portal before deleting the file
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Drop database");
+            Console.WriteLine($"[{DateTime.Now}] Drop database");
             AzureBlockBlobStream.DropDatabase(connectionString, databaseName);
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Done");
+            Console.WriteLine($"[{DateTime.Now}] Done");
         }
 
         private static void TestLiteDBWithAzurePageBlob()
@@ -48,22 +50,58 @@ namespace Demo
             using (var stream = new AzurePageBlobStream(connectionString, databaseName))
                 TestWriteDatabase(stream);
 
+            AzurePageBlobStream.Download(connectionString, databaseName, @"c:\temp\testdb2.db");
+
             // read
             using (var stream = new AzurePageBlobStream(connectionString, databaseName))
                 TestReadDatabase(stream);
 
             // clean up; you can checkout the files in azure portal before deleting the file
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Drop database");
+            Console.WriteLine($"[{DateTime.Now}] Drop database");
             AzurePageBlobStream.DropDatabase(connectionString, databaseName);
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Done");
+            Console.WriteLine($"[{DateTime.Now}] Done");
+        }
+
+        private static void TestLiteDBWithAzurePageBlobNew()
+        {
+            var databaseName = "db1";
+            string accountName = "audmstorage";
+            var containerName = AzurePageBlobStream.DefaultContainerName;
+
+            // write
+            AzurePageBlobStreamNew.WriteDebugLogs = true;
+            using (var stream = new AzurePageBlobStreamNew(accountName, containerName, databaseName))
+                TestWriteDatabase(stream);
+
+            AzurePageBlobStreamNew.Download(accountName, containerName, databaseName, @"c:\temp\testdb2.db");
+
+            // read
+            using (var stream = new AzurePageBlobStreamNew(accountName, containerName, databaseName))
+                TestReadDatabase(stream);
+
+            // clean up; you can checkout the files in azure portal before deleting the file
+            Console.WriteLine($"[{DateTime.Now}] Drop database");
+            AzurePageBlobStreamNew.DropDatabase(accountName, containerName, databaseName);
+            Console.WriteLine($"[{DateTime.Now}] Done");
         }
 
         private static void TestWriteDatabase(Stream stream)
         {
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Start writing");
+            Console.WriteLine($"[{DateTime.Now}] Start writing");
             using (var db = new LiteDatabase(stream))
             {
                 var collection = db.GetCollection<Book>();
+                //foreach (var i in Enumerable.Range(1, 1000))
+                //{
+                //    var blog = new Book
+                //    {
+                //        Id = i,
+                //        Title = "fake title " + i,
+                //        Author = "fake author " + i,
+                //        Description = $"fake description {i} fake description end"
+                //    };
+                //    collection.Upsert(blog);
+                //}
                 ParallelEnumerable.Range(1, 1000)
                     .ForAll(i =>
                     {
@@ -78,27 +116,37 @@ namespace Demo
                     });
                 db.Checkpoint(); // flush
             }
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Finish writing");
+            Console.WriteLine($"[{DateTime.Now}] Finish writing");
         }
 
         private static void TestReadDatabase(Stream stream)
         {
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Start reading");
+            Console.WriteLine($"[{DateTime.Now}] Start reading");
             using (var db = new LiteDatabase(stream))
             {
                 var collection = db.GetCollection<Book>();
+                var allBooks = collection.FindAll().ToList();
+                //foreach (var i in Enumerable.Range(1, 100))
+                //{
+                //    var id = i * 5;
+                //    var blog = collection.FindById(id);
+                //    if (blog == null)
+                //        throw new NotImplementedException("Cannot find " + id);
+                //    else
+                //        Console.WriteLine($"{blog.Id}:{blog.Title}");
+                //}
                 ParallelEnumerable.Range(1, 100)
                     .ForAll(i =>
                     {
                         var id = i * 5;
                         var blog = collection.FindById(id);
                         if (blog == null)
-                            throw new NotImplementedException("Cannot find " + id);
+                            throw new NotImplementedException($"Cannot find {id}");
                         else
                             Console.WriteLine($"{blog.Id}:{blog.Title}");
                     });
             }
-            Console.WriteLine($"[{DateTime.Now.ToString()}] Finish reading");
+            Console.WriteLine($"[{DateTime.Now}] Finish reading");
         }
     }
 

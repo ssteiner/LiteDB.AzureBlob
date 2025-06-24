@@ -135,6 +135,8 @@ namespace LiteDB.AzureBlob
                         var off = position + PageSize * i;
                         if (Cache.ContainsKey(off) == false)
                         {
+                            if (WriteDebugLogs)
+                                Console.WriteLine($"Read @{off} #{count}");
                             ReadAhead(off);
                             break;
                         }
