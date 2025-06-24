@@ -1,9 +1,9 @@
 ﻿using LiteDB;
 using LiteDB.AzureBlob;
+using Microsoft.Extensions.Logging;
 using System;
 using System.IO;
 using System.Linq;
-using System.Threading.Tasks;
 
 namespace Demo
 {
@@ -12,7 +12,7 @@ namespace Demo
         static void Main(string[] args)
         {
             // TestLiteDBWithAzureBlockBlob();
-            TestLiteDBWithAzurePageBlob();
+            //TestLiteDBWithAzurePageBlob();
             TestLiteDBWithAzurePageBlobNew();
         }
 
@@ -64,19 +64,25 @@ namespace Demo
 
         private static void TestLiteDBWithAzurePageBlobNew()
         {
+            using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddConsole());
+            ILogger logger = factory.CreateLogger<Program>();
+
             var databaseName = "db1";
             string accountName = "audmstorage";
             var containerName = AzurePageBlobStream.DefaultContainerName;
 
             // write
             AzurePageBlobStreamNew.WriteDebugLogs = true;
-            using (var stream = new AzurePageBlobStreamNew(accountName, containerName, databaseName))
+            using (var stream = new AzurePageBlobStreamNew(accountName, containerName, databaseName, logger))
+            {
                 TestWriteDatabase(stream);
+                TestReadDatabase(stream);
+            }
 
             AzurePageBlobStreamNew.Download(accountName, containerName, databaseName, @"c:\temp\testdb2.db");
 
             // read
-            using (var stream = new AzurePageBlobStreamNew(accountName, containerName, databaseName))
+            using (var stream = new AzurePageBlobStreamNew(accountName, containerName, databaseName, logger))
                 TestReadDatabase(stream);
 
             // clean up; you can checkout the files in azure portal before deleting the file
@@ -140,10 +146,10 @@ namespace Demo
                     {
                         var id = i * 5;
                         var blog = collection.FindById(id);
-                        if (blog == null)
-                            throw new NotImplementedException($"Cannot find {id}");
-                        else
-                            Console.WriteLine($"{blog.Id}:{blog.Title}");
+                        //if (blog == null)
+                        //    throw new NotImplementedException($"Cannot find {id}");
+                        //else
+                        //    Console.WriteLine($"{blog.Id}:{blog.Title}");
                     });
             }
             Console.WriteLine($"[{DateTime.Now}] Finish reading");

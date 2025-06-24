@@ -36,19 +36,23 @@ namespace LiteDB.AzureBlob
         readonly object[] Locks = new object[NumberOfLocks];
         readonly ConcurrentDictionary<long, byte[]> Pending = new ConcurrentDictionary<long, byte[]>();
         readonly BlockingCollection<byte[]> Buffers = new BlockingCollection<byte[]>();
+        readonly ConcurrentDictionary<long, Lazy<ReaderWriterLockSlim>> locks = new ConcurrentDictionary<long, Lazy<ReaderWriterLockSlim>>();
+        readonly ConcurrentDictionary<long, Task<BlobDownloadResult>> ongoingDownloads = new ConcurrentDictionary<long, Task<BlobDownloadResult>>();
         long LazyLength = 0;
 
         private IDictionary<string, string> metaData;
-        private ILogger logger;
+        private readonly ILogger logger;
 
-        public AzurePageBlobStreamNew(string connString, string databaseName)
+        public AzurePageBlobStreamNew(string connString, string databaseName, ILogger logger = null)
             : this(GetBlobReference(connString, databaseName), databaseName)
         {
+            this.logger = logger;
         }
 
-        public AzurePageBlobStreamNew(string storageAccount, string containerName, string databaseName)
+        public AzurePageBlobStreamNew(string storageAccount, string containerName, string databaseName, ILogger logger = null)
             : this(GetBlobReferenceFromStorageAccount(storageAccount, containerName, databaseName), databaseName)
         {
+            this.logger = logger;
         }
 
         private AzurePageBlobStreamNew(PageBlobClient blob, string databaseName)
@@ -56,7 +60,7 @@ namespace LiteDB.AzureBlob
             if (!blob.Exists().Value)
             {
                 if (WriteDebugLogs)
-                    Console.WriteLine("Creating new page blob file " + databaseName);
+                    Log($"Creating new page blob file {databaseName}", LogLevel.Debug);
                 var contentInfo = blob.Create(DefaultStreamSize);
                 //blob.SetAccessTier(DefaultBlobTier);
             }
@@ -99,11 +103,21 @@ namespace LiteDB.AzureBlob
         {
             _Length = newLength;
             if (WriteDebugLogs)
-                Console.WriteLine($"SetLength = {newLength / PageSize}");
-            if (metaData == null)
-                metaData = Blob.GetProperties().Value.Metadata;
-            metaData[MetadataLengthKey] = newLength.ToString();
-            Blob.SetMetadataAsync(metaData); // .Wait();
+                Log($"SetLength = {newLength / PageSize}", LogLevel.Debug);
+            try
+            {
+                if (metaData == null)
+                {
+                    Log($"Metadata is not yet known, downloading..", LogLevel.Warning);
+                    metaData = Blob.GetProperties().Value.Metadata;
+                }
+                metaData[MetadataLengthKey] = newLength.ToString();
+                Blob.SetMetadataAsync(metaData); // .Wait();
+            }
+            catch (RequestFailedException e)
+            {
+                Log($"Unable to update metadata for {Blob.Name}: {e.Message}", LogLevel.Error);
+            }
         }
 
         long? _Length = null;
@@ -123,7 +137,7 @@ namespace LiteDB.AzureBlob
                     if (realLength % PageSize != 0)
                         throw new NotImplementedException("file size is invalid!");
                     if (WriteDebugLogs)
-                        Console.WriteLine($"GetLength = {realLength / PageSize}");
+                        Log($"GetLength = {realLength / PageSize}", LogLevel.Debug);
                     _Length = realLength;
                 }
                 return _Length.Value;
@@ -162,8 +176,6 @@ namespace LiteDB.AzureBlob
             }
             if (cached == null)
             {
-                if (WriteDebugLogs)
-                    Console.WriteLine($"Read @{position / PageSize} #{count / PageSize}");
                 ReadAhead(position, buffer, offset);
                 return count;
             }
@@ -176,8 +188,6 @@ namespace LiteDB.AzureBlob
                         var off = position + PageSize * i;
                         if (Cache.ContainsKey(off) == false)
                         {
-                            if (WriteDebugLogs)
-                                Console.WriteLine($"Read @{off / PageSize} #{count / PageSize} cached");
                             ReadAhead(off);
                             break;
                         }
@@ -209,40 +219,155 @@ namespace LiteDB.AzureBlob
 
             if (bufToReturn != null)
             {
-                if (WriteDebugLogs)
-                    Console.WriteLine($"Downloading from {position} length {buf.Length} with return buffer");
-                //var res = Blob.DownloadContentAsync(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) }).Result;
-                var res = Blob.DownloadContent(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) });
-                //res.Value.Content.ToArray().CopyTo(buf, 0);
-                res.Value.Content.ToMemory().CopyTo(buf);
-                //var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
-                //Debug.Assert(ret == buf.Length);
-                Buffer.BlockCopy(CachePage(0), 0, bufToReturn, offset, PageSize);
-                Task.Run(() =>
+                var data = DownloadContent(buf, position);
+                if (data != null)
                 {
-                    for (var i = 1; i < Pages; i++)
-                        CachePage(i);
-                    Buffers.Add(buf);
-                });
+                    //var res = Blob.DownloadContent(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) });
+                    //res.Value.Content.ToMemory().CopyTo(buf);
+                    data.ToMemory().CopyTo(buf);
+                    Buffer.BlockCopy(CachePage(0), 0, bufToReturn, offset, PageSize);
+                    Task.Run(() =>
+                    {
+                        for (var i = 1; i < Pages; i++)
+                            CachePage(i);
+                        Buffers.Add(buf);
+                    });
+                }
             }
             else
             {
                 Task.Run(() =>
                 {
-                    if (WriteDebugLogs)
-                        Console.WriteLine($"Downloading from {position} length {buf.Length}");
-                    //var res = Blob.DownloadContentAsync(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) }).Result;
-                    var res = Blob.DownloadContent(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) });
-                    //res.Value.Content.ToArray().CopyTo(buf, 0);
-                    res.Value.Content.ToMemory().CopyTo(buf);
-                    //var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
-                    //Debug.Assert(ret == buf.Length);
-                    for (var i = 0; i < Pages; i++)
-                        CachePage(i);
-                    Buffers.Add(buf);
+                    var data = DownloadContent(buf, position);
+                    if (data != null)
+                    {
+                        data.ToMemory().CopyTo(buf);
+                        //var res = Blob.DownloadContent(new BlobDownloadOptions { Range = new HttpRange(position, buf.Length) });
+                        //res.Value.Content.ToMemory().CopyTo(buf);
+                        for (var i = 0; i < Pages; i++)
+                            CachePage(i);
+                        Buffers.Add(buf);
+                    }
                 });
             }
         }
+
+        private BinaryData DownloadContent(byte[] buf, long position)
+        {
+            var myLock = locks.GetOrAdd(position, LockFactory);
+            Task<BlobDownloadResult> downloadJob = null;
+            bool lockEntered = false, jobAdded = false;
+            try
+            {
+                lockEntered = myLock.Value.TryEnterWriteLock(-1);
+                if (lockEntered)
+                {
+                    if (!ongoingDownloads.TryGetValue(position, out downloadJob))
+                    {
+                        Log($"Starting new download job for position {position}", LogLevel.Debug);
+                        downloadJob = DownloadBlock(position, buf.Length);
+                        jobAdded = ongoingDownloads.TryAdd(position, downloadJob);
+                    }
+                    //else
+                    //    Log($"There's already an ongoing download for position {position}", LogLevel.Debug);
+                }
+            }
+            catch (Exception e)
+            {
+                Log($"Error while trying to download block at position {position}: {e.Message}", LogLevel.Error);
+                return null;
+            }
+            finally
+            {
+                if (lockEntered && myLock.Value.IsWriteLockHeld)
+                    myLock.Value.ExitWriteLock();
+            }
+            try
+            {
+                downloadJob.Wait();
+                if (downloadJob.IsCompleted)
+                {
+                    return downloadJob.Result.Content;
+                }
+                else if (downloadJob.IsCanceled)
+                {
+                    Log($"Download for position {position} was canceled", LogLevel.Warning);
+                }
+                else if (downloadJob.IsFaulted)
+                {
+                    Log($"Download for position {position} failed: {downloadJob.Exception?.Message}", LogLevel.Error);
+                }
+            }
+            catch (Exception e)
+            {
+                Log($"Error while waiting for download completion for position {position}: {e.Message}", LogLevel.Error);
+                return null;
+            }
+            finally
+            {
+                if (jobAdded)
+                    _ = RemoveFromOngoingDownloads(myLock.Value, position);
+                //ongoingDownloads.TryRemove(position, out _);
+            }
+            return null;
+        }
+
+        private async Task<BlobDownloadResult> DownloadBlock(long position, int length)
+        {
+            if (WriteDebugLogs)
+                Log($"Downloading from {position} length {length}", LogLevel.Debug);
+            try
+            {
+                var res = await Blob.DownloadContentAsync(new BlobDownloadOptions { Range = new HttpRange(position, length) });
+                metaData = res.Value.Details.Metadata;
+                Log($"Downloading from {position} length {length} complete", LogLevel.Debug);
+                return res.Value;
+            }
+            catch (Exception e)
+            {
+                Log($"Unable to download block at position {position}: {e.Message}", LogLevel.Error);
+                return null;
+            }
+        }
+
+        private async Task RemoveFromOngoingDownloads(ReaderWriterLockSlim myLock, long position)
+        {
+            bool lockEntered = false;
+            try
+            {
+                await Task.Delay(5000).ConfigureAwait(false);
+            }
+            catch (Exception) { }
+            try
+            {
+                lockEntered = myLock.TryEnterWriteLock(5000);
+                if (!lockEntered)
+                {
+                    Log($"Unable to enter write lock for removal of number lock of position {position}", LogLevel.Error);
+                }
+            }
+            catch (Exception e)
+            {
+                Log($"Unable to acquire lock for position {position}, in download postprocessing: {e.Message}", LogLevel.Error);
+            }
+            finally
+            {
+                if (!ongoingDownloads.TryRemove(position, out _))
+                    Log($"Unable to remove ongoing download for position {position}", LogLevel.Error);
+                try
+                {
+                    if (lockEntered && myLock.IsWriteLockHeld)
+                    {
+                        myLock.ExitWriteLock();
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log($"Unable to exit write lock for download of position {position}: {e.Message}", LogLevel.Error);
+                }
+            }
+        }
+
 
         public override long Seek(long offset, SeekOrigin origin)
         {
@@ -284,7 +409,7 @@ namespace LiteDB.AzureBlob
                 return;
 
             if (WriteDebugLogs)
-                Console.WriteLine("Flush " + string.Join(",", Pending.Select(t => t.Key / PageSize)));
+                Log($"Flush {string.Join(",", Pending.Select(t => t.Key / PageSize))}", LogLevel.Debug);
 
             Queue<KeyValuePair<long, byte[]>> queue;
             lock (Pending)
@@ -321,12 +446,18 @@ namespace LiteDB.AzureBlob
                         var task = Task.Run(() =>
                         {
                             var p = batch.Peek();
-                            using (var ms = new MemoryStream(p.Value))
+                            try
                             {
-                                if (WriteDebugLogs)
-                                    Console.WriteLine($"WriteOne @{p.Key / PageSize}");
-                                Blob.UploadPages(ms, p.Key);
-                                //Blob.WritePagesAsync(ms, p.Key, null).Wait();
+                                using (var ms = new MemoryStream(p.Value))
+                                {
+                                    if (WriteDebugLogs)
+                                        Log($"WriteOne @{p.Key / PageSize}", LogLevel.Debug);
+                                    Blob.UploadPages(ms, p.Key);
+                                }
+                            }
+                            catch (RequestFailedException e)
+                            {
+                                Log($"Error while writing single page at {p.Key / PageSize}: {e.Message}", LogLevel.Error);
                             }
                         });
                         tasks.Add(task);
@@ -356,11 +487,17 @@ namespace LiteDB.AzureBlob
                                 offsetWithinBuf += PageSize;
                             }
                             if (WriteDebugLogs)
-                                Console.WriteLine($"WriteBatch @{offsetStart / PageSize} #{cnt}");
-                            using (var ms = new MemoryStream(buf, 0, offsetWithinBuf))
+                                Log($"WriteBatch @{offsetStart / PageSize} #{cnt}", LogLevel.Debug);
+                            try
                             {
-                                Blob.UploadPages(ms, offsetStart);
-                                //Blob.WritePagesAsync(ms, offsetStart, null).Wait();
+                                using (var ms = new MemoryStream(buf, 0, offsetWithinBuf))
+                                {
+                                    Blob.UploadPages(ms, offsetStart);
+                                }   
+                            }
+                            catch (RequestFailedException e)
+                            {
+                                Log($"Error while writing batch at {offsetStart / PageSize}: {e.Message}", LogLevel.Error);
                             }
                             Buffers.Add(buf);
                         });
@@ -380,14 +517,14 @@ namespace LiteDB.AzureBlob
 
         public static void DropDatabase(string connString, string name)
         {
-            Console.WriteLine("Deleting " + name);
+            Console.WriteLine($"Deleting {name}");
             var blob = GetBlobReference(connString, name);
             blob.DeleteIfExists();
         }
 
         public static void DropDatabase(string accountName, string containerName, string name)
         {
-            Console.WriteLine("Deleting " + name);
+            Console.WriteLine($"Deleting {name}");
             var blob = GetBlobReferenceFromStorageAccount(accountName, containerName, name);
             blob.DeleteIfExists();
         }
@@ -414,7 +551,14 @@ namespace LiteDB.AzureBlob
 
         private void Log(string message, LogLevel level)
         {
-            logger?.Log(level, message);
+            if (logger != null)
+                logger?.Log(level, message);
+            Console.WriteLine($"{level}|{message}");
+        }
+
+        private static Lazy<ReaderWriterLockSlim> LockFactory(long position)
+        {
+            return new Lazy<ReaderWriterLockSlim>(() => new ReaderWriterLockSlim());
         }
 
         /*
@@ -436,5 +580,10 @@ namespace LiteDB.AzureBlob
             }
         }
         */
+
+        private class DownloadIdentifier
+        {
+            internal long Position { get; set; }
+        }
     }
 }
